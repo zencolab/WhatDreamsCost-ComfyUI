@@ -2,7 +2,8 @@
 # MiniMax-H3 导演台 Colab 运行版的公共小工具。
 # 由 notebook 的 Cell 1 拉下来 exec 进全局命名空间，用法和写在格子里完全一样。
 # 这些函数几乎不需要改，抽出来是为了让 notebook 只剩下配置和流程。
-import json, os, re, shutil, subprocess, sys, time
+import json, os, shutil, struct, subprocess, sys, time
+import re
 
 def save_cfg():
     with open(CFG["cfg_path"], "w") as f:
@@ -256,18 +257,82 @@ def start_colab_proxy():
     return "Colab 端口代理新窗口（弹窗被拦就允许一下）"
 
 
-def start_cloudflared():
-    cf = ROOT + "/cloudflared"
-    if not os.path.exists(cf):
-        sh("wget -q -O %s https://github.com/cloudflare/cloudflared/releases/"
-           "latest/download/cloudflared-linux-amd64" % cf, check=False)
-        sh("chmod +x " + cf, quiet=True)
-    subprocess.Popen("%s tunnel --no-autoupdate --url http://127.0.0.1:%d "
-                     "--logfile %s/cf.log > /dev/null 2>&1" % (cf, PORT, ROOT), shell=True)
-    for _ in range(40):
-        time.sleep(2)
-        txt = open(ROOT + "/cf.log", errors="ignore").read() if os.path.exists(ROOT + "/cf.log") else ""
-        m = re.search(r"https://[-a-z0-9]+\.trycloudflare\.com", txt)
-        if m:
-            return m.group(0)
-    return None
+# ---------- 模型落盘（Cell 5 用）/ ComfyUI 接口（Cell 8 用）----------
+def link_real(src, final):
+    """HF 缓存里是相对符号链接，先 realpath 解成真 blob 再硬链，
+    否则换目录后立刻悬空 -> getsize 报 [Errno 2]。"""
+    real = os.path.realpath(src)
+    if not os.path.isfile(real):
+        raise RuntimeError("HF 缓存解析失败: %s -> %s" % (src, real))
+    if os.path.lexists(final) and not os.path.exists(final):
+        os.unlink(final)                       # 清掉上一轮的悬空链接
+    if os.path.lexists(final):
+        return real
+    try:
+        os.link(real, final)
+    except OSError:
+        try:
+            os.symlink(real, final)
+        except OSError:
+            shutil.copy2(real, final)
+    return real
+
+
+def safetensors_ok(path):
+    size = os.path.getsize(os.path.realpath(path))
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        if n <= 0 or n + 8 > size:
+            return False, size
+        json.loads(f.read(n))
+    return True, size
+
+
+def add_diffusion_prefix(src, dst, prefix="diffusion_model."):
+    """作者的 LoRA 键是 blocks.0.*，ComfyUI 要 diffusion_model. 命名空间。
+    只重写 JSON 头，数据区原样拷贝，不用 import torch。"""
+    tmp = dst + ".part"
+    with open(src, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        head = json.loads(f.read(n))
+        meta = head.pop("__metadata__", None)
+        new, renamed = {}, 0
+        for k, v in head.items():
+            if k.startswith(prefix):
+                new[k] = v
+            else:
+                new[prefix + k] = v
+                renamed += 1
+        if meta is not None:
+            new = dict([("__metadata__", meta)] + list(new.items()))
+        hb = json.dumps(new, separators=(",", ":")).encode("utf-8")
+        hb += b" " * ((-len(hb)) % 8)
+        with open(tmp, "wb") as o:
+            o.write(struct.pack("<Q", len(hb)))
+            o.write(hb)
+            shutil.copyfileobj(f, o, 8 * 1024 ** 2)
+    os.replace(tmp, dst)
+    log("LoRA 键名已加前缀：%d 个 tensor" % renamed)
+
+
+def fetch(repo, filename, subdir, rename):
+    dest_dir = os.path.join(COMFY, "models", subdir)
+    os.makedirs(dest_dir, exist_ok=True)
+    base = rename or os.path.basename(filename)
+    final = os.path.join(dest_dir, base)
+    if os.path.exists(final) and os.path.getsize(os.path.realpath(final)) > 100 * 1024 ** 2:
+        return base, "跳过(已存在) %.1f GB" % (os.path.getsize(os.path.realpath(final)) / 1024 ** 3)
+    src = hf_hub_download(repo_id=repo, filename=filename, repo_type="model")
+    if rename and repo == CFG["lora_repo"]:
+        add_diffusion_prefix(os.path.realpath(src), final)
+    else:
+        link_real(src, final)
+    ok, size = safetensors_ok(final)
+    if not ok:
+        raise RuntimeError("%s 头部校验失败，文件不完整" % base)
+    return base, "完成 %.1f GB" % (size / 1024 ** 3)
+
+
+def api(path):
+    with urllib.request.urlopen("http://127.0.0.1:%d%s" % (PORT, path), timeout=60) as r:
+        return json.load(r)
