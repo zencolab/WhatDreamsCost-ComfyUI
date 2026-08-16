@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pysrt
 from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 from indextts.infer_v2_5 import IndexTTS2
 
 VIDEO = Path('/content/video.mp4')
@@ -98,6 +99,22 @@ def match_loudness(clip: AudioSegment, reference: AudioSegment) -> AudioSegment:
         gain = max(-8.0, min(8.0, reference.dBFS - clip.dBFS))
         clip = clip.apply_gain(gain)
     return clip
+
+
+def trim_outer_silence(clip: AudioSegment) -> AudioSegment:
+    """去掉TTS首尾多余静音，先减少时长，再决定是否变速。"""
+    if not math.isfinite(clip.dBFS):
+        return clip
+    ranges = detect_nonsilent(
+        clip,
+        min_silence_len=40,
+        silence_thresh=max(-55.0, clip.dBFS - 18.0),
+    )
+    if not ranges:
+        return clip
+    start = max(0, ranges[0][0] - 20)
+    end = min(len(clip), ranges[-1][1] + 40)
+    return clip[start:end]
 
 
 def remux_original_audio():
@@ -238,20 +255,25 @@ def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
             break
         duration_factor = max(0.80, min(1.20, duration_factor * available_ms / actual_ms))
 
-    actual_ms = len(AudioSegment.from_file(raw))
+    # 先裁掉模型在首尾生成的静音，避免把停顿误算成说话时长。
+    generated = trim_outer_silence(AudioSegment.from_file(raw))
+    trimmed = TEMP_DIR / f"line_{job['line_no']}_trimmed.wav"
+    generated.export(trimmed, format='wav')
+    actual_ms = len(generated)
+
     if actual_ms > available_ms:
+        # 没有空白时间时仍继续完成，不再抛错中断；只对这一句做精确变速。
         speed = actual_ms / available_ms
-        if speed > 1.20:
-            raise ValueError(
-                f"{job['name']}连同下一句前的空白时间仍不够，需要压缩{speed:.2f}倍；"
-                '请缩短文字或在剪映中延长这一段。'
-            )
+        print(
+            f"⚠️ {job['name']}没有可用空白，裁静音后仍需压缩{speed:.2f}倍；"
+            '将自动处理并继续生成视频。'
+        )
         subprocess.run([
-            'ffmpeg', '-y', '-loglevel', 'error', '-i', str(raw),
+            'ffmpeg', '-y', '-loglevel', 'error', '-i', str(trimmed),
             '-filter:a', atempo_chain(speed), str(fitted),
         ], check=True)
     else:
-        shutil.copyfile(raw, fitted)
+        generated.export(fitted, format='wav')
 
     clip = AudioSegment.from_file(fitted).set_frame_rate(44100).set_channels(2)
     reference = vocals[job['start']:job['end']] if job['kind'] == 'correction' else AudioSegment.from_file(VOICE)
