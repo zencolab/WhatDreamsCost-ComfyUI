@@ -125,6 +125,17 @@ final_subtitles = copy.deepcopy(original_subtitles)
 final_by_index = {row.index: row for row in final_subtitles}
 jobs = []
 
+# 每句最多可自然延伸到下一句前100ms，优先利用空白时间而不是强行加速。
+ordered_subtitles = sorted(original_subtitles, key=lambda row: row.start.ordinal)
+max_end_by_index = {}
+for position, row in enumerate(ordered_subtitles):
+    next_start = (
+        ordered_subtitles[position + 1].start.ordinal
+        if position + 1 < len(ordered_subtitles)
+        else video_ms
+    )
+    max_end_by_index[row.index] = max(row.end.ordinal, next_start - 100)
+
 for key, value in corrections.items():
     line_no = int(key)
     if line_no not in original_by_index:
@@ -136,7 +147,8 @@ for key, value in corrections.items():
     final_by_index[line_no].text = text
     jobs.append({
         'kind': 'correction', 'name': f'修正#{line_no}', 'line_no': line_no,
-        'start': source.start.ordinal, 'end': source.end.ordinal, 'text': text,
+        'start': source.start.ordinal, 'end': source.end.ordinal,
+        'max_end': max_end_by_index[line_no], 'text': text,
     })
     print(f'修正 #{line_no}：{clean_text(source.text)} → {text}')
 
@@ -154,7 +166,7 @@ for number, item in enumerate(additions, start=1):
     final_subtitles.append(pysrt.SubRipItem(index=0, start=start, end=end, text=text))
     jobs.append({
         'kind': 'addition', 'name': f'新增#{number}', 'line_no': 10000 + number,
-        'start': start.ordinal, 'end': end.ordinal, 'text': text,
+        'start': start.ordinal, 'end': end.ordinal, 'max_end': end.ordinal, 'text': text,
     })
     print(f'新增：{start} --> {end} | {text}')
 
@@ -174,22 +186,12 @@ vocals = pad_track(AudioSegment.from_file(VOCALS), video_ms)
 background = pad_track(AudioSegment.from_file(BACKGROUND), video_ms)
 final_mix = original_audio
 
-# 原音频只在被修改句子的范围内换成“无人物声”的背景轨；其余时间逐采样保留原声。
-for job in jobs:
-    if job['kind'] == 'correction':
-        mute_start = max(0, job['start'] - 60)
-        mute_end = min(video_ms, job['end'] + 80)
-        final_mix = (
-            final_mix[:mute_start]
-            + background[mute_start:mute_end]
-            + final_mix[mute_end:]
-        )
-
 print('正在加载 IndexTTS 2.5；只生成被修改或新增的台词……')
 tts = IndexTTS2(
     cfg_path='/content/index-tts/checkpoints/config.yaml',
     model_dir='/content/index-tts/checkpoints',
     use_bf16=True,
+    use_cuda_kernel=False,
 )
 print('✅ 模型加载完成')
 
@@ -210,11 +212,12 @@ def make_emotion_prompt(job) -> Path | None:
 
 def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
     target_ms = job['end'] - job['start']
+    available_ms = max(target_ms, job['max_end'] - job['start'])
     raw = TEMP_DIR / f"line_{job['line_no']}_raw.wav"
     fitted = TEMP_DIR / f"line_{job['line_no']}_fitted.wav"
     duration_factor = 1.0
 
-    # 最多生成两次，并限制加速幅度，避免再次出现“连珠炮”。
+    # 最多生成两次；如果后面有空白，允许自然延长，不强压进原字幕长度。
     for attempt in range(1, 3):
         tts.infer(
             spk_audio_prompt=str(VOICE),
@@ -227,18 +230,21 @@ def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
         actual_ms = len(AudioSegment.from_file(raw))
         if actual_ms <= 0:
             raise RuntimeError(f"{job['name']}没有生成有效音频。")
-        print(f"{job['name']} 尝试{attempt}：目标{target_ms}ms，生成{actual_ms}ms")
-        if actual_ms <= target_ms * 1.08:
+        print(
+            f"{job['name']} 尝试{attempt}：原时长{target_ms}ms，"
+            f"可用{available_ms}ms，生成{actual_ms}ms"
+        )
+        if actual_ms <= target_ms * 1.08 or actual_ms <= available_ms:
             break
-        duration_factor = max(0.80, min(1.20, duration_factor * target_ms / actual_ms))
+        duration_factor = max(0.80, min(1.20, duration_factor * available_ms / actual_ms))
 
     actual_ms = len(AudioSegment.from_file(raw))
-    if actual_ms > target_ms:
-        speed = actual_ms / target_ms
+    if actual_ms > available_ms:
+        speed = actual_ms / available_ms
         if speed > 1.20:
             raise ValueError(
-                f"{job['name']}文字过长，需要压缩{speed:.2f}倍，会变成连珠炮；"
-                '请缩短文字或在剪映中延长该句时间。'
+                f"{job['name']}连同下一句前的空白时间仍不够，需要压缩{speed:.2f}倍；"
+                '请缩短文字或在剪映中延长这一段。'
             )
         subprocess.run([
             'ffmpeg', '-y', '-loglevel', 'error', '-i', str(raw),
@@ -250,14 +256,22 @@ def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
     clip = AudioSegment.from_file(fitted).set_frame_rate(44100).set_channels(2)
     reference = vocals[job['start']:job['end']] if job['kind'] == 'correction' else AudioSegment.from_file(VOICE)
     clip = match_loudness(clip, reference)
-    if len(clip) < target_ms:
-        clip += silence(target_ms - len(clip))
-    return clip[:target_ms].fade_in(15).fade_out(25)
+    clip = clip[:available_ms].fade_in(15).fade_out(25)
+    job['render_end'] = job['start'] + len(clip)
+    return clip
 
 
 for job in jobs:
     prompt = make_emotion_prompt(job)
     clip = generate_natural_line(job, prompt)
+    if job['kind'] == 'correction':
+        mute_start = max(0, job['start'] - 60)
+        mute_end = min(video_ms, max(job['end'], job['render_end']) + 80)
+        final_mix = (
+            final_mix[:mute_start]
+            + background[mute_start:mute_end]
+            + final_mix[mute_end:]
+        )
     final_mix = final_mix.overlay(clip, position=job['start'])
 
 # 只有修改区间使用分离后的背景轨；其他区间保持原视频音频不变。
