@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -8,12 +9,14 @@ import pysrt
 from pydub import AudioSegment
 from indextts.infer_v2_5 import IndexTTS2
 
-# 上传单元格会把三个输入文件统一保存到这些位置。
+# 上传单元格会把输入文件统一保存到这些位置。
 VIDEO = Path('/content/video.mp4')
 SRT = Path('/content/subtitles.srt')
 VOICE = Path('/content/voice.wav')
+EDITS = Path('/content/dialogue_edits.json')
 
 OUTPUT = Path('/content/video_new_voice.mp4')
+FINAL_SRT = Path('/content/subtitles_final.srt')
 NEW_VOICE_WAV = Path('/content/new_voice_track.wav')
 TEMP_DIR = Path('/content/index_dub_temp')
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -21,7 +24,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 def require_file(path: Path):
     if not path.exists():
-        raise FileNotFoundError(f'缺少文件：{path}。请重新运行“上传三个文件”单元格。')
+        raise FileNotFoundError(f'缺少文件：{path}。请重新运行上传单元格。')
 
 
 for input_path in (VIDEO, SRT, VOICE):
@@ -62,6 +65,66 @@ def load_srt(path: Path):
     raise RuntimeError(f'字幕编码无法识别：{last_error}')
 
 
+def parse_time(value: str):
+    """接受 00:00:12,500 或 00:00:12.500。"""
+    value = value.strip().replace('.', ',')
+    try:
+        return pysrt.SubRipTime.from_string(value)
+    except Exception as exc:
+        raise ValueError(f'时间格式错误：{value}；应为 00:00:12,500') from exc
+
+
+def apply_dialogue_edits(subtitles, video_ms: int):
+    """应用错词修正和新增台词；配置不存在时保持原字幕。"""
+    if not EDITS.exists():
+        print('未找到台词修改配置，使用原字幕。')
+        return subtitles
+
+    data = json.loads(EDITS.read_text(encoding='utf-8'))
+    corrections = data.get('corrections', {})
+    additions = data.get('additions', [])
+
+    # 修改错句、错词：编号对应上传后显示的原 SRT 编号。
+    for key, new_text in corrections.items():
+        line_no = int(key)
+        if not 1 <= line_no <= len(subtitles):
+            raise ValueError(f'修正编号 {line_no} 不存在；原字幕共 {len(subtitles)} 条。')
+        new_text = str(new_text).strip()
+        if not new_text:
+            raise ValueError(f'第 {line_no} 条修正文字不能为空。')
+        old_text = subtitles[line_no - 1].text.replace('\n', ' ')
+        subtitles[line_no - 1].text = new_text
+        print(f'修正 #{line_no}：{old_text} → {new_text}')
+
+    # 增加短暂台词：必须放在没有其他字幕的空白时间内。
+    for item in additions:
+        start = parse_time(str(item['start']))
+        end = parse_time(str(item['end']))
+        text = str(item['text']).strip()
+        if not text:
+            raise ValueError('新增台词不能为空。')
+        if end.ordinal <= start.ordinal:
+            raise ValueError(f'新增台词结束时间必须晚于开始时间：{item}')
+        if end.ordinal > video_ms:
+            raise ValueError(f'新增台词超出视频长度：{item}')
+
+        for existing in subtitles:
+            overlaps = max(start.ordinal, existing.start.ordinal) < min(end.ordinal, existing.end.ordinal)
+            if overlaps:
+                raise ValueError(
+                    f'新增台词“{text}”与原字幕 #{existing.index} 时间重叠；'
+                    '请选择没有人说话的时间段。'
+                )
+
+        subtitles.append(pysrt.SubRipItem(index=0, start=start, end=end, text=text))
+        print(f'新增：{start} --> {end} | {text}')
+
+    subtitles[:] = sorted(subtitles, key=lambda row: row.start.ordinal)
+    for index, row in enumerate(subtitles, start=1):
+        row.index = index
+    return subtitles
+
+
 print('正在加载 IndexTTS 2.5；第一次可能需要下载辅助模型……')
 tts = IndexTTS2(
     cfg_path='/content/index-tts/checkpoints/config.yaml',
@@ -77,7 +140,6 @@ def generate_fitted_line(text: str, target_ms: int, line_no: int) -> AudioSegmen
     fitted_path = TEMP_DIR / f'line_{line_no:04d}_fitted.wav'
     duration_factor = 1.0
 
-    # 先让 IndexTTS 最多尝试 4 次，尽量自然地接近目标时长。
     for attempt in range(1, 5):
         tts.infer(
             spk_audio_prompt=str(VOICE),
@@ -103,14 +165,13 @@ def generate_fitted_line(text: str, target_ms: int, line_no: int) -> AudioSegmen
         duration_factor *= target_ms / actual_ms
         duration_factor = max(0.5, min(2.0, duration_factor))
 
-    # 对最后几十毫秒的误差做无变调微调，保证音频正好落入字幕时间段。
+    # 对最后的时长误差做无变调微调。
     actual_ms = len(AudioSegment.from_file(raw_path))
     if abs(actual_ms - target_ms) > 20:
-        speed = actual_ms / target_ms
         subprocess.run([
             'ffmpeg', '-y', '-loglevel', 'error',
             '-i', str(raw_path),
-            '-filter:a', atempo_chain(speed),
+            '-filter:a', atempo_chain(actual_ms / target_ms),
             str(fitted_path),
         ], check=True)
     else:
@@ -121,26 +182,21 @@ def generate_fitted_line(text: str, target_ms: int, line_no: int) -> AudioSegmen
         clip += AudioSegment.silent(duration=target_ms - len(clip), frame_rate=44100)
     elif len(clip) > target_ms:
         clip = clip[:target_ms]
-
-    # 短淡入淡出，避免句子边缘出现爆音。
     return clip.fade_in(10).fade_out(20)
 
 
-subtitles = load_srt(SRT)
+video_ms = video_duration_ms(VIDEO)
+subtitles = apply_dialogue_edits(load_srt(SRT), video_ms)
 if not subtitles:
     raise RuntimeError('字幕文件中没有可用台词。')
+subtitles.save(str(FINAL_SRT), encoding='utf-8')
 
-full_track = AudioSegment.silent(
-    duration=video_duration_ms(VIDEO),
-    frame_rate=44100,
-).set_channels(1)
-
-print(f'共读取 {len(subtitles)} 句字幕，开始逐句生成：')
+full_track = AudioSegment.silent(duration=video_ms, frame_rate=44100).set_channels(1)
+print(f'共处理 {len(subtitles)} 句字幕，开始逐句生成：')
 for line_no, subtitle in enumerate(subtitles, start=1):
     start_ms = subtitle.start.ordinal
     end_ms = subtitle.end.ordinal
     target_ms = end_ms - start_ms
-
     text = re.sub(r'<[^>]+>', '', subtitle.text.replace('\n', ' ')).strip()
     if not text or target_ms < 200:
         print(f'[{line_no}/{len(subtitles)}] 跳过空字幕或过短字幕')
@@ -153,20 +209,14 @@ for line_no, subtitle in enumerate(subtitles, start=1):
 full_track.export(NEW_VOICE_WAV, format='wav')
 print('\n✅ 新人声音轨生成完成，正在替换视频原音轨……')
 
-# 默认丢弃视频中的全部旧声音，只保留新生成的人声。
-# 这样不会出现新旧人声重叠；背景音乐也会同时被移除。
+# 丢弃视频全部旧声音，只保留新生成人声。
 subprocess.run([
     'ffmpeg', '-y', '-loglevel', 'error',
     '-i', str(VIDEO),
     '-i', str(NEW_VOICE_WAV),
-    '-map', '0:v:0',
-    '-map', '1:a:0',
-    '-c:v', 'copy',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-movflags', '+faststart',
-    '-shortest',
+    '-map', '0:v:0', '-map', '1:a:0',
+    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+    '-movflags', '+faststart', '-shortest',
     str(OUTPUT),
 ], check=True)
-
 print(f'✅ 完成：{OUTPUT}')
