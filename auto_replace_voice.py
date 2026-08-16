@@ -65,6 +65,11 @@ def clean_text(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text.replace('\n', ' ')).strip()
 
 
+def spoken_units(text: str) -> list[str]:
+    """提取会形成口型的中文字符或字母数字词，忽略标点。"""
+    return re.findall(r'[\u3400-\u9fff]|[A-Za-z0-9]+', clean_text(text))
+
+
 def pad_track(track: AudioSegment, duration_ms: int) -> AudioSegment:
     track = track.set_frame_rate(44100).set_channels(2)
     if len(track) < duration_ms:
@@ -136,22 +141,12 @@ if EDITS.exists():
 corrections = config.get('corrections') or {}
 additions = config.get('additions') or []
 
-# 构建“只修改指定台词”的任务；其他原声完全保留。
+# 音频-only口型安全模式：只局部替换等音节错词，不重做整句。
 original_by_index = {row.index: row for row in original_subtitles}
 final_subtitles = copy.deepcopy(original_subtitles)
 final_by_index = {row.index: row for row in final_subtitles}
 jobs = []
-
-# 每句最多可自然延伸到下一句前100ms，优先利用空白时间而不是强行加速。
-ordered_subtitles = sorted(original_subtitles, key=lambda row: row.start.ordinal)
-max_end_by_index = {}
-for position, row in enumerate(ordered_subtitles):
-    next_start = (
-        ordered_subtitles[position + 1].start.ordinal
-        if position + 1 < len(ordered_subtitles)
-        else video_ms
-    )
-    max_end_by_index[row.index] = max(row.end.ordinal, next_start - 100)
+skipped_messages = []
 
 for key, value in corrections.items():
     line_no = int(key)
@@ -160,32 +155,66 @@ for key, value in corrections.items():
     text = str(value).strip()
     if not text:
         raise ValueError(f'第 #{line_no} 条修正文字不能为空。')
+
     source = original_by_index[line_no]
+    old_text = clean_text(source.text)
+    old_units = spoken_units(old_text)
+    new_units = spoken_units(text)
+
+    if not old_units or not new_units:
+        message = f'修正#{line_no}已跳过：无法识别有效台词。'
+        skipped_messages.append(message)
+        print(f'⚠️ {message}')
+        continue
+
+    if len(old_units) != len(new_units):
+        message = (
+            f'修正#{line_no}已跳过：原台词{len(old_units)}个音节，新台词{len(new_units)}个音节；'
+            '只改音频时，增加或删除音节无法与原口型同步。'
+        )
+        skipped_messages.append(message)
+        print(f'⚠️ {message}')
+        continue
+
+    first_diff = next((i for i, pair in enumerate(zip(old_units, new_units)) if pair[0] != pair[1]), len(old_units))
+    if first_diff == len(old_units):
+        # 只有标点变化，不重新生成声音。
+        final_by_index[line_no].text = text
+        print(f'字幕 #{line_no}：只修改标点，保留原声音频。')
+        continue
+
+    last_diff = len(old_units) - 1 - next(
+        i for i, pair in enumerate(zip(reversed(old_units), reversed(new_units))) if pair[0] != pair[1]
+    )
+
+    # 在错词左右各保留一个字作为TTS上下文，只替换这一小段。
+    unit_start = max(0, first_diff - 1)
+    unit_end = min(len(old_units), last_diff + 2)
+    line_start = source.start.ordinal
+    line_end = source.end.ordinal
+    line_duration = line_end - line_start
+    patch_start = line_start + round(line_duration * unit_start / len(old_units))
+    patch_end = line_start + round(line_duration * unit_end / len(old_units))
+    patch_text = ''.join(new_units[unit_start:unit_end])
+    if unit_end == len(new_units):
+        ending = re.search(r'[，。！？?!；：…]+$', text)
+        if ending:
+            patch_text += ending.group(0)
+
     final_by_index[line_no].text = text
     jobs.append({
         'kind': 'correction', 'name': f'修正#{line_no}', 'line_no': line_no,
-        'start': source.start.ordinal, 'end': source.end.ordinal,
-        'max_end': max_end_by_index[line_no], 'text': text,
+        'start': patch_start, 'end': patch_end, 'max_end': patch_end,
+        'text': patch_text,
     })
-    print(f'修正 #{line_no}：{clean_text(source.text)} → {text}')
+    old_patch = ''.join(old_units[unit_start:unit_end])
+    print(f'修正 #{line_no}：{old_text} → {text}')
+    print(f'  仅局部替换：{old_patch} → {patch_text}，其余原声音频保持不变。')
 
-occupied = [(row.start.ordinal, row.end.ordinal, f'原字幕#{row.index}') for row in original_subtitles]
 for number, item in enumerate(additions, start=1):
-    start = parse_time(str(item['start']))
-    end = parse_time(str(item['end']))
-    text = str(item['text']).strip()
-    if not text or end.ordinal <= start.ordinal or end.ordinal > video_ms:
-        raise ValueError(f'新增台词配置无效：{item}')
-    for old_start, old_end, label in occupied:
-        if max(start.ordinal, old_start) < min(end.ordinal, old_end):
-            raise ValueError(f'新增台词“{text}”与{label}重叠，请选择无人说话的空白时间。')
-    occupied.append((start.ordinal, end.ordinal, f'新增#{number}'))
-    final_subtitles.append(pysrt.SubRipItem(index=0, start=start, end=end, text=text))
-    jobs.append({
-        'kind': 'addition', 'name': f'新增#{number}', 'line_no': 10000 + number,
-        'start': start.ordinal, 'end': end.ordinal, 'max_end': end.ordinal, 'text': text,
-    })
-    print(f'新增：{start} --> {end} | {text}')
+    message = f'新增#{number}已跳过：原视频没有对应嘴部动作；只改音频无法保证口型同步。'
+    skipped_messages.append(message)
+    print(f'⚠️ {message}')
 
 final_subtitles.sort(key=lambda row: row.start.ordinal)
 for index, row in enumerate(final_subtitles, start=1):
@@ -203,7 +232,7 @@ vocals = pad_track(AudioSegment.from_file(VOCALS), video_ms)
 background = pad_track(AudioSegment.from_file(BACKGROUND), video_ms)
 final_mix = original_audio
 
-print('正在加载 IndexTTS 2.5；只生成被修改或新增的台词……')
+print('正在加载 IndexTTS 2.5；只生成等音节错词的局部音频……')
 tts = IndexTTS2(
     cfg_path='/content/index-tts/checkpoints/config.yaml',
     model_dir='/content/index-tts/checkpoints',
@@ -234,7 +263,7 @@ def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
     fitted = TEMP_DIR / f"line_{job['line_no']}_fitted.wav"
     duration_factor = 1.0
 
-    # 最多生成两次；如果后面有空白，允许自然延长，不强压进原字幕长度。
+    # 最多生成两次，再精确匹配局部错词窗口。
     for attempt in range(1, 3):
         tts.infer(
             spk_audio_prompt=str(VOICE),
@@ -262,11 +291,11 @@ def generate_natural_line(job, emotion_prompt: Path | None) -> AudioSegment:
     actual_ms = len(generated)
 
     if actual_ms > available_ms:
-        # 没有空白时间时仍继续完成，不再抛错中断；只对这一句做精确变速。
+        # 只对局部错词片段变速，绝不重做或压缩整句。
         speed = actual_ms / available_ms
         print(
-            f"⚠️ {job['name']}没有可用空白，裁静音后仍需压缩{speed:.2f}倍；"
-            '将自动处理并继续生成视频。'
+            f"⚠️ {job['name']}局部片段需压缩{speed:.2f}倍；"
+            '只处理错词窗口，句子其余部分不变。'
         )
         subprocess.run([
             'ffmpeg', '-y', '-loglevel', 'error', '-i', str(trimmed),
@@ -303,5 +332,5 @@ subprocess.run([
     '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
     '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', str(OUTPUT),
 ], check=True)
-print('✅ 已保留原声语气、其他人物、背景音乐和音效。')
+print('✅ 口型安全模式：只局部替换等音节错词，其余原声、人物、音乐和音效均保留。')
 print(f'✅ 完成：{OUTPUT}')
